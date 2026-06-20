@@ -55,3 +55,7 @@ Drop a `name.md` in `agents/` with YAML frontmatter (`name`, `title`,
 - Match the surrounding code's style and comment density.
 - Keep the security posture intact: the UI binds to loopback and is meant for a
   tailnet (see [SECURITY.md](./SECURITY.md)).
+- When working on a repo other sessions share (e.g. the vibes monorepo),
+  follow [docs/repo-hygiene.md](./docs/repo-hygiene.md): author in an isolated
+  worktree, no destructive git on the shared tree, explicit-pathspec commits,
+  and build (not just typecheck) before merge.

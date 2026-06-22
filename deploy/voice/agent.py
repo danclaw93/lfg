@@ -18,11 +18,14 @@ optional: if a plugin/model/weight isn't installed the worker logs it and falls
 back to the previous batch/default behavior, so it always starts.
 
 Env:
-  STT_WS_URL   ws:// endpoint of the streaming-STT server (deploy/streaming-stt);
-               unset = batch STT.
+  STT_WS_URL            ws:// endpoint of the streaming-STT server
+                        (deploy/streaming-stt); unset = batch STT.
+  LIVEKIT_INFERENCE_URL set only if you run a LiveKit inference gateway / Cloud;
+                        unset = on-box local turn detection (the self-hosted norm).
 Extra deps for the realtime path (install into the lk-agent venv):
-  livekit-plugins-silero  livekit-plugins-turn-detector
-  then once: `python agent.py download-files`
+  livekit-plugins-turn-detector   (local end-of-utterance model)
+  then once: `python agent.py download-files` to fetch its weights.
+VAD is AgentSession's bundled Silero default — no separate plugin needed.
 
 Run:  LIVEKIT_URL=ws://127.0.0.1:7880 LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
       /home/dev/lk-agent/bin/python agent.py dev
@@ -36,6 +39,7 @@ import json
 import os
 import re
 import time
+import warnings
 import wave
 from pathlib import Path
 
@@ -46,6 +50,7 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    TurnHandlingOptions,
     WorkerOptions,
     cli,
     llm,
@@ -54,23 +59,6 @@ from livekit.agents import (
     tts,
     utils,
 )
-
-# Optional realtime plugins. The worker MUST still start if any are missing —
-# it falls back to the batch/default path and logs what to install. These power
-# the high-performance path: Silero VAD + a semantic end-of-utterance model that
-# endpoints a turn far faster (and more accurately) than a fixed silence timeout.
-try:
-    from livekit.plugins import silero as _silero  # livekit-plugins-silero
-except Exception as _e:  # pragma: no cover
-    _silero = None
-    print(f"[voice] silero VAD unavailable ({_e}); default endpointing", flush=True)
-try:
-    # English semantic end-of-turn model. Install: livekit-plugins-turn-detector,
-    # then fetch weights once with `python agent.py download-files`.
-    from livekit.plugins.turn_detector.english import EnglishModel as _EOUModel
-except Exception as _e:  # pragma: no cover
-    _EOUModel = None
-    print(f"[voice] turn-detector unavailable ({_e}); VAD endpointing", flush=True)
 
 LFG = os.environ.get("LFG_BASE", "http://127.0.0.1:8766")
 CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
@@ -1139,6 +1127,48 @@ async def start_session(session: AgentSession, *, clear: bool) -> None:
         pass
 
 
+def _load_turn_detection():
+    """Turn-detection mode for AgentSession (self-hosted-correct).
+
+    AgentSession's NEW default turn detector is livekit.agents.inference.
+    TurnDetector, which runs end-of-turn inference through LiveKit's HOSTED
+    agent-gateway (https://agent-gateway.livekit.cloud by default) authenticated
+    with LIVEKIT_API_*. That fits LiveKit Cloud / a self-hosted inference gateway
+    — but THIS box runs a local livekit-server with no such gateway, so the hosted
+    detector would ship every turn to a remote service we have no account on.
+
+    So, in order:
+      1. if an inference gateway is configured (LIVEKIT_INFERENCE_URL), use the
+         new hosted inference.TurnDetector;
+      2. else use the LOCAL onnx EnglishModel — the plugin is deprecated, but it
+         runs on-box and is the right call for self-hosting (weights fetched via
+         `python agent.py download-files`);
+      3. else fall back to the "vad" string mode (plain VAD endpointing).
+    Always returns an explicit value, so AgentSession's hosted-cloud default
+    never engages on this self-hosted box.
+    """
+    if os.environ.get("LIVEKIT_INFERENCE_URL"):
+        try:
+            from livekit.agents import inference
+
+            print("[voice] turn-detection: hosted inference gateway", flush=True)
+            return inference.TurnDetector()
+        except Exception as e:
+            print(f"[voice] hosted TurnDetector unavailable ({e})", flush=True)
+    try:
+        # Local model. Suppress the plugin's import-time DeprecationWarning — we
+        # are deliberately using the local path (the suggested replacement is the
+        # cloud detector above, which doesn't fit a self-hosted deployment).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            from livekit.plugins.turn_detector.english import EnglishModel
+        print("[voice] turn-detection: local EnglishModel (on-box)", flush=True)
+        return EnglishModel()
+    except Exception as e:
+        print(f"[voice] turn-detector unavailable ({e}); plain VAD endpointing", flush=True)
+        return "vad"
+
+
 # ── worker entrypoint ───────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext) -> None:
     global ROOM
@@ -1149,27 +1179,16 @@ async def entrypoint(ctx: JobContext) -> None:
     #   - STT: streaming (NeMo) when STT_WS_URL is set, else batch (make_stt).
     #   - LLM: Haiku, streamed token-by-token (LfgLLM/anthropic_stream).
     #   - TTS: sentence-pipelined off the LLM stream (build_tts/StreamAdapter).
-    #   - Turn-taking: Silero VAD + a semantic end-of-utterance model so a turn
-    #     endpoints in ~200-300ms instead of waiting out a fixed silence timeout.
-    # Each realtime add-on is optional — if its plugin/weights aren't installed
-    # the kwarg is simply omitted and LiveKit falls back to default endpointing.
-    session_kwargs: dict = {}
-    if _silero is not None:
-        try:
-            session_kwargs["vad"] = _silero.VAD.load()
-        except Exception as e:
-            print(f"[voice] silero load failed ({e}); default endpointing", flush=True)
-    if _EOUModel is not None:
-        try:
-            session_kwargs["turn_detection"] = _EOUModel()
-        except Exception as e:
-            print(f"[voice] turn-detector load failed ({e}); VAD endpointing", flush=True)
-
+    #   - Turn-taking: a semantic end-of-utterance model (on-box) over the bundled
+    #     Silero VAD, so a turn endpoints in ~200-300ms vs a fixed silence timeout.
+    # turn_handling is the current API (replaces the deprecated vad=/turn_detection=
+    # kwargs); we pass turn_detection explicitly because the default is the hosted
+    # cloud detector. VAD is AgentSession's bundled Silero default — no vad= needed.
     session = AgentSession(
         stt=make_stt(),
         llm=LfgLLM(),
         tts=build_tts(),
-        **session_kwargs,
+        turn_handling=TurnHandlingOptions(turn_detection=_load_turn_detection()),
     )
 
     # A fresh tap of the orb shows up here as a participant (re)joining the

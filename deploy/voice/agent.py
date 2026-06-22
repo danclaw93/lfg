@@ -1,10 +1,28 @@
 """
-lfg voice agent worker (LiveKit Agents 1.6.x).
+lfg voice agent worker (LiveKit Agents 1.6.x) — high-performance realtime path.
 
-Pipeline: LiveKit room audio -> (bundled Silero VAD) -> custom STT (lfg
-/api/voice/stt, faster-whisper) -> custom LLM (bridges to a dedicated Haiku
-Claude Code session via /api/sessions/<id>/send + /stream) -> custom TTS
-(lfg /api/voice/tts) -> agent audio track back to the room.
+Pipeline (every stage streams + overlaps the next):
+  room audio
+    -> Silero VAD + semantic end-of-utterance model (fast, accurate turn-taking)
+    -> STT: streaming NeMo cache-aware FastConformer over a websocket when
+       STT_WS_URL is set (interim + final transcripts); else batch lfg
+       /api/voice/stt (faster-whisper) as the safe default.
+    -> LLM: Haiku via the Messages API streamed over SSE — text deltas are
+       spoken as they arrive (anthropic_stream + LfgLLM).
+    -> TTS: lfg /api/voice/tts wrapped in a sentence StreamAdapter, so sentence 1
+       synthesizes while the model is still generating sentence 2 (build_tts).
+    -> agent audio track back to the room.
+
+Realtime add-ons (VAD, turn-detector, streaming STT, TTS StreamAdapter) are each
+optional: if a plugin/model/weight isn't installed the worker logs it and falls
+back to the previous batch/default behavior, so it always starts.
+
+Env:
+  STT_WS_URL   ws:// endpoint of the streaming-STT server (deploy/streaming-stt);
+               unset = batch STT.
+Extra deps for the realtime path (install into the lk-agent venv):
+  livekit-plugins-silero  livekit-plugins-turn-detector
+  then once: `python agent.py download-files`
 
 Run:  LIVEKIT_URL=ws://127.0.0.1:7880 LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
       /home/dev/lk-agent/bin/python agent.py dev
@@ -32,9 +50,27 @@ from livekit.agents import (
     cli,
     llm,
     stt,
+    tokenize,
     tts,
     utils,
 )
+
+# Optional realtime plugins. The worker MUST still start if any are missing —
+# it falls back to the batch/default path and logs what to install. These power
+# the high-performance path: Silero VAD + a semantic end-of-utterance model that
+# endpoints a turn far faster (and more accurately) than a fixed silence timeout.
+try:
+    from livekit.plugins import silero as _silero  # livekit-plugins-silero
+except Exception as _e:  # pragma: no cover
+    _silero = None
+    print(f"[voice] silero VAD unavailable ({_e}); default endpointing", flush=True)
+try:
+    # English semantic end-of-turn model. Install: livekit-plugins-turn-detector,
+    # then fetch weights once with `python agent.py download-files`.
+    from livekit.plugins.turn_detector.english import EnglishModel as _EOUModel
+except Exception as _e:  # pragma: no cover
+    _EOUModel = None
+    print(f"[voice] turn-detector unavailable ({_e}); VAD endpointing", flush=True)
 
 LFG = os.environ.get("LFG_BASE", "http://127.0.0.1:8766")
 CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
@@ -215,6 +251,138 @@ class LfgSTT(stt.STT):
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(language=language or "en", text=text)],
         )
+
+
+# ── STT (streaming): NeMo cache-aware FastConformer over a websocket ─────────
+# Opt-in via STT_WS_URL. When set, audio frames stream to a streaming-ASR server
+# that emits interim ("partial") and "final" transcripts as the user speaks, so
+# the pipeline can endpoint and react far sooner than batch whisper. When unset,
+# make_stt() returns the batch LfgSTT above unchanged (the safe default).
+#
+# Wire protocol (server side — see deploy/streaming-stt/):
+#   client -> server : raw 16 kHz mono int16 PCM as binary ws frames,
+#                      then a text frame {"type":"eof"} at end of stream.
+#   server -> client : text frames {"type":"partial"|"final","text": "..."}.
+STT_WS_URL = os.environ.get("STT_WS_URL", "").strip()
+STT_SAMPLE_RATE = 16000
+
+
+class LfgStreamingSTT(stt.STT):
+    def __init__(self, ws_url: str) -> None:
+        super().__init__(
+            capabilities=stt.STTCapabilities(streaming=True, interim_results=True)
+        )
+        self._ws_url = ws_url
+
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        # Batch fallback so .recognize() (non-stream callers) still works: reuse
+        # the existing HTTP STT proxy rather than the websocket.
+        frame = rtc.combine_audio_frames(buffer)
+        wav = _pcm16_wav(bytes(frame.data), frame.sample_rate, frame.num_channels)
+        text = ""
+        try:
+            http = await get_http()
+            async with http.post(
+                f"{LFG}/api/voice/stt",
+                data=wav,
+                headers={"Content-Type": "application/octet-stream"},
+            ) as r:
+                if r.status == 200:
+                    text = ((await r.json()).get("text") or "").strip()
+        except Exception:
+            pass
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language=language or "en", text=text)],
+        )
+
+    def stream(self, *, language=None, conn_options=None):
+        return LfgSpeechStream(stt=self, ws_url=self._ws_url, conn_options=conn_options)
+
+
+class LfgSpeechStream(stt.SpeechStream):
+    def __init__(self, *, stt, ws_url, conn_options=None) -> None:
+        # sample_rate makes the base class resample input frames to 16 kHz for us.
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=STT_SAMPLE_RATE)
+        self._ws_url = ws_url
+
+    async def _run(self) -> None:
+        http = await get_http()
+        ws = await http.ws_connect(self._ws_url)
+
+        async def send_audio() -> None:
+            # self._input_ch yields rtc.AudioFrame (already resampled to 16 kHz)
+            # interleaved with flush sentinels at utterance boundaries (VAD/turn
+            # end). The stream is long-lived across turns: forward PCM bytes, and
+            # on a sentinel ask the server to finalize + reset for the next turn.
+            # Send a real eof only when the whole stream closes.
+            async for frame in self._input_ch:
+                if isinstance(frame, rtc.AudioFrame):
+                    await ws.send_bytes(bytes(frame.data))
+                else:
+                    try:
+                        await ws.send_str(json.dumps({"type": "flush"}))
+                    except Exception:
+                        pass
+            try:
+                await ws.send_str(json.dumps({"type": "eof"}))
+            except Exception:
+                pass
+
+        async def recv_text() -> None:
+            spoke_start = False
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    ev = json.loads(msg.data)
+                except Exception:
+                    continue
+                kind = ev.get("type")
+                text = (ev.get("text") or "").strip()
+                if kind == "partial":
+                    if not spoke_start:
+                        spoke_start = True
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
+                        )
+                    if text:
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                                alternatives=[stt.SpeechData(language="en", text=text)],
+                            )
+                        )
+                elif kind == "final":
+                    if text:
+                        print(f"[voice] user: {text}", flush=True)
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(language="en", text=text)],
+                        )
+                    )
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
+                    )
+                    spoke_start = False
+
+        try:
+            await asyncio.gather(send_audio(), recv_text())
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
+def make_stt():
+    """Streaming STT when STT_WS_URL is configured, else batch STT (default)."""
+    if STT_WS_URL:
+        print(f"[voice] STT: streaming via {STT_WS_URL}", flush=True)
+        return LfgStreamingSTT(STT_WS_URL)
+    print("[voice] STT: batch (/api/voice/stt)", flush=True)
+    return LfgSTT()
 
 
 # ── fleet tools (Anthropic tool-use, backed by the lfg HTTP API) ─────────────
@@ -560,6 +728,115 @@ async def anthropic_call(
         return None
 
 
+async def anthropic_stream(
+    messages: list[dict],
+    system: str,
+    *,
+    model: str = HAIKU_MODEL,
+    tools: list[dict] | None = None,
+    max_tokens: int,
+    on_text=None,
+) -> tuple[list[dict] | None, str | None]:
+    """One STREAMING Messages API call (OAuth, SSE).
+
+    Returns (content_blocks, stop_reason) assembled from the stream — the same
+    shape run_brain's tool loop expects from a non-streaming response. As each
+    assistant text delta arrives it is handed to on_text(delta) so the caller can
+    start speaking sentence 1 while the model is still generating sentence 2 (the
+    TTS StreamAdapter downstream segments the delta stream into sentences). Tool
+    inputs stream as partial JSON and are assembled + parsed at block stop.
+
+    Returns (None, None) on auth failure / HTTP error / stream error so the caller
+    can recover exactly as it did for a None non-streaming response.
+    """
+    token = _oauth_token()
+    if not token:
+        return None, None
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+        "stream": True,
+    }
+    if tools:
+        body["tools"] = tools
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    http = await get_http()
+    blocks: dict[int, dict] = {}      # index -> content block being assembled
+    json_bufs: dict[int, str] = {}    # index -> partial tool_use input JSON
+    stop_reason: str | None = None
+    try:
+        async with http.post(ANTHROPIC_URL, json=body, headers=headers) as resp:
+            if resp.status != 200:
+                return None, None
+            # Anthropic SSE: lines are `event: <t>` / `data: <json>` / blank.
+            # Every data payload carries its own `type`, so we parse data lines
+            # and ignore the event: lines entirely.
+            async for raw in resp.content:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                etype = ev.get("type")
+                if etype == "content_block_start":
+                    idx = ev.get("index", 0)
+                    cb = ev.get("content_block") or {}
+                    if cb.get("type") == "text":
+                        blocks[idx] = {"type": "text", "text": ""}
+                    elif cb.get("type") == "tool_use":
+                        blocks[idx] = {
+                            "type": "tool_use",
+                            "id": cb.get("id"),
+                            "name": cb.get("name"),
+                            "input": {},
+                        }
+                        json_bufs[idx] = ""
+                elif etype == "content_block_delta":
+                    idx = ev.get("index", 0)
+                    d = ev.get("delta") or {}
+                    dt = d.get("type")
+                    if dt == "text_delta":
+                        chunk = d.get("text", "")
+                        if idx in blocks:
+                            blocks[idx]["text"] += chunk
+                        if chunk and on_text:
+                            on_text(chunk)
+                    elif dt == "input_json_delta":
+                        json_bufs[idx] = json_bufs.get(idx, "") + d.get("partial_json", "")
+                elif etype == "content_block_stop":
+                    idx = ev.get("index", 0)
+                    if idx in json_bufs:
+                        raw_json = json_bufs.get(idx) or ""
+                        try:
+                            blocks[idx]["input"] = json.loads(raw_json) if raw_json else {}
+                        except Exception:
+                            blocks[idx]["input"] = {}
+                elif etype == "message_delta":
+                    sr = (ev.get("delta") or {}).get("stop_reason")
+                    if sr:
+                        stop_reason = sr
+                elif etype == "error":
+                    print(f"[voice] anthropic stream error: {ev.get('error')}", flush=True)
+                    return None, None
+    except Exception as e:
+        print(f"[voice] anthropic stream failed: {e}", flush=True)
+        return None, None
+    ordered = [blocks[i] for i in sorted(blocks)]
+    return ordered, stop_reason
+
+
 # ── the advisor: ONE in-process Opus hop ─────────────────────────────────────
 # The voice brain (Haiku) handles everything live. When a question is genuinely
 # hard or risky, it consults Opus ONCE — same fleet tools, so the advisor can
@@ -596,33 +873,35 @@ async def run_brain(msgs, *, model: str, system: str, emit=None, tools=None) -> 
     if tools is None:
         tools = BRAIN_TOOLS
     for _ in range(6):
-        resp = await anthropic_call(
-            msgs, system, model=model, tools=tools, max_tokens=600
+        # Stream the turn: text deltas are spoken as they arrive (sentence 1
+        # starts playing while sentence 2 is still being generated), and the
+        # blocks + stop_reason come back assembled so the tool loop is unchanged.
+        spoke = {"any": False}
+
+        def on_text(chunk: str) -> None:
+            spoke["any"] = True
+            if emit:
+                emit(chunk)
+
+        blocks, stop_reason = await anthropic_stream(
+            msgs, system, model=model, tools=tools, max_tokens=600, on_text=on_text
         )
-        if not resp:
+        if blocks is None:
             return ""
-        blocks = resp.get("content") or []
-        if resp.get("stop_reason") == "tool_use":
+        if stop_reason == "tool_use":
             msgs.append({"role": "assistant", "content": blocks})
             tool_names = [
                 b.get("name", "") for b in blocks if b.get("type") == "tool_use"
             ]
-            # Speak any preamble the model produced alongside the tool call (e.g.
-            # "let me check with the advisor"). Without this, text blocks on a
-            # tool-use turn are dropped and the user hears dead air through a
-            # slow consult. Guarantee a "hold on" even with no preamble — and
-            # keep it present-tense intent ("about to"), never "done" (the model
-            # is told never to claim completion before it sees the result).
-            preamble = "".join(
-                b.get("text", "") for b in blocks if b.get("type") == "text"
-            ).strip()
-            if not preamble:
-                # Guarantee spoken feedback for EVERY tool call (not just a
-                # hand-picked few) — pick the first tool's preamble, falling
-                # back to a generic one so no tool ever runs in silence.
+            # Any preamble the model produced alongside the tool call (e.g. "let
+            # me check with the advisor") has ALREADY been streamed+spoken via
+            # on_text above. If it produced none, speak a canned one so a
+            # (possibly slow) tool never runs in silence — present-tense intent
+            # ("about to"), never "done" (the model never claims completion
+            # before it sees the result).
+            if not spoke["any"] and emit:
                 first_tool = next((n for n in tool_names if n), "")
                 preamble = TOOL_PREAMBLES.get(first_tool, GENERIC_PREAMBLE)
-            if preamble and emit:
                 print(f"[voice] say (preamble): {preamble}", flush=True)
                 emit(preamble)
             print(f"[voice] tool_use ({model}): {tool_names}", flush=True)
@@ -647,13 +926,14 @@ async def run_brain(msgs, *, model: str, system: str, emit=None, tools=None) -> 
                 )
             msgs.append({"role": "user", "content": results})
             continue
-        # final answer
+        # Final answer — the text was already streamed+spoken to emit() during
+        # the call (do NOT emit again or the reply is spoken twice). Just return
+        # the assembled text for logging and as the advisor's return value.
         text = "".join(
             b.get("text", "") for b in blocks if b.get("type") == "text"
         ).strip()
-        if text and emit:
+        if text:
             print(f"[voice] reply ({model}): {text}", flush=True)
-            emit(text)
         return text
     return ""
 
@@ -752,6 +1032,27 @@ class LfgTTS(tts.TTS):
         return LfgTTSStream(tts=self, input_text=text, conn_options=conn_options)
 
 
+def build_tts():
+    """Sentence-pipelined TTS.
+
+    LfgTTS itself isn't streaming-input (the GPU engine takes a full text and
+    streams the audio back), so wrap it in a StreamAdapter with a sentence
+    tokenizer: as the LLM streams its reply, the adapter cuts it into sentences
+    and synthesizes each one as soon as it's complete — sentence 1's audio plays
+    while sentence 2 is still being generated. Falls back to the bare (whole-
+    utterance) TTS if the adapter/tokenizer API differs in this livekit-agents
+    build, so the worker always starts."""
+    base = LfgTTS()
+    try:
+        return tts.StreamAdapter(
+            tts=base,
+            sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
+        )
+    except Exception as e:  # pragma: no cover
+        print(f"[voice] TTS StreamAdapter unavailable ({e}); whole-utterance TTS", flush=True)
+        return base
+
+
 # ── proactive briefing ──────────────────────────────────────────────────────
 async def make_briefing(snapshot: str) -> str:
     """Turn the raw snapshot into a <=2 sentence spoken greeting + status."""
@@ -844,7 +1145,32 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     ROOM = ctx.room
 
-    session = AgentSession(stt=LfgSTT(), llm=LfgLLM(), tts=LfgTTS())
+    # High-performance realtime pipeline:
+    #   - STT: streaming (NeMo) when STT_WS_URL is set, else batch (make_stt).
+    #   - LLM: Haiku, streamed token-by-token (LfgLLM/anthropic_stream).
+    #   - TTS: sentence-pipelined off the LLM stream (build_tts/StreamAdapter).
+    #   - Turn-taking: Silero VAD + a semantic end-of-utterance model so a turn
+    #     endpoints in ~200-300ms instead of waiting out a fixed silence timeout.
+    # Each realtime add-on is optional — if its plugin/weights aren't installed
+    # the kwarg is simply omitted and LiveKit falls back to default endpointing.
+    session_kwargs: dict = {}
+    if _silero is not None:
+        try:
+            session_kwargs["vad"] = _silero.VAD.load()
+        except Exception as e:
+            print(f"[voice] silero load failed ({e}); default endpointing", flush=True)
+    if _EOUModel is not None:
+        try:
+            session_kwargs["turn_detection"] = _EOUModel()
+        except Exception as e:
+            print(f"[voice] turn-detector load failed ({e}); VAD endpointing", flush=True)
+
+    session = AgentSession(
+        stt=make_stt(),
+        llm=LfgLLM(),
+        tts=build_tts(),
+        **session_kwargs,
+    )
 
     # A fresh tap of the orb shows up here as a participant (re)joining the
     # persistent "voice" room. Clear the prior conversation and re-brief so each

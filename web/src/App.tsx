@@ -80,6 +80,7 @@ import { haptic } from "@/lib/haptics";
 import { reportError } from "./lib/report-error";
 import { lazyWithReload } from "./lib/lazy-with-reload";
 import { appPath, appWebSocketUrl } from "./lib/base-path";
+import { mergeSessionListSeeds } from "./lib/live-session-state";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -680,26 +681,6 @@ function escapeHtml(value: string) {
 
 function normText(value?: string) {
   return (value || "").replace(/\s+/g, " ").trim();
-}
-
-function seedMessageForSession(session: Session): Message | null {
-  const sid = session.sessionId;
-  const last = session.last;
-  const lastIsProse =
-    last?.kind === "text" && (last.role === "assistant" || last.role === "user") && !!last.text;
-  const text = normText(lastIsProse ? last.text : session.lastUserText || "");
-  if (!sid || !text) return null;
-  const role = lastIsProse && last.role === "assistant" ? "assistant" : "user";
-  const ts = (lastIsProse ? last.ts : null) ?? session.lastActivityAt ?? session.startedAt ?? Date.now();
-  return {
-    id: `seed-${sid}-${ts}-${role}`,
-    role,
-    kind: "text",
-    text,
-    html: escapeHtml(text).replace(/\n/g, "<br>"),
-    ts,
-    seed: true,
-  };
 }
 
 // Encode captured PCM (Float32) as a 16-bit mono WAV — the format the server's
@@ -1960,6 +1941,10 @@ function useLiveSessionStream(sessions: Session[], streamIds: string[]) {
     [streamIds],
   );
   const streamKey = ids.join(",");
+  const liveSids = useMemo(
+    () => sessions.map((session) => session.sessionId).filter((id): id is string => !!id),
+    [sessions],
+  );
   // Busy baseline straight off the list payload — covers sessions we are NOT
   // streaming. The stream's per-session busy (below) overrides this for expanded
   // cards, where it updates ~1s instead of every 5s poll.
@@ -1967,14 +1952,6 @@ function useLiveSessionStream(sessions: Session[], streamIds: string[]) {
     const map: Record<string, boolean> = {};
     for (const session of sessions) {
       if (session.sessionId) map[session.sessionId] = !!session.busy;
-    }
-    return map;
-  }, [sessions]);
-  const seedBySid = useMemo(() => {
-    const map: Record<string, Message> = {};
-    for (const session of sessions) {
-      const seed = seedMessageForSession(session);
-      if (session.sessionId && seed) map[session.sessionId] = seed;
     }
     return map;
   }, [sessions]);
@@ -2001,19 +1978,27 @@ function useLiveSessionStream(sessions: Session[], streamIds: string[]) {
   const thinkTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   useEffect(() => {
-    const active = new Set(ids);
-    const live = new Set(Object.keys(listBusy));
+    const live = new Set(liveSids);
     seenRef.current = Object.fromEntries(
       Object.entries(seenRef.current).filter(([sid]) => live.has(sid)),
     );
-    setMessagesBySid((prev) => {
-      const next: Record<string, Message[]> = {};
-      for (const sid of live) {
-        const current = prev[sid];
-        next[sid] = current?.length ? current : seedBySid[sid] ? [seedBySid[sid]] : [];
+    setMessagesBySid((prev) => mergeSessionListSeeds(prev, sessions));
+    setNextBeforeBySid((prev) => {
+      let changed = false;
+      const next: Record<string, number | null> = {};
+      for (const [sid, value] of Object.entries(prev)) {
+        if (live.has(sid)) {
+          next[sid] = value;
+        } else {
+          changed = true;
+        }
       }
-      return next;
+      return changed ? next : prev;
     });
+  }, [liveSids, sessions]);
+
+  useEffect(() => {
+    const active = new Set(ids);
     setBusyBySid((prev) =>
       Object.fromEntries(Object.entries(prev).filter(([sid]) => active.has(sid))),
     );
@@ -2023,11 +2008,8 @@ function useLiveSessionStream(sessions: Session[], streamIds: string[]) {
     setQueuesBySid((prev) =>
       Object.fromEntries(Object.entries(prev).filter(([sid]) => active.has(sid))),
     );
-    setNextBeforeBySid((prev) =>
-      Object.fromEntries(Object.entries(prev).filter(([sid]) => live.has(sid))),
-    );
     setLoadingBySid((prev) => {
-      const next = Object.fromEntries(Object.entries(prev).filter(([sid]) => live.has(sid)));
+      const next = Object.fromEntries(Object.entries(prev).filter(([sid]) => active.has(sid)));
       for (const sid of active) {
         if (!(messagesRef.current[sid]?.some((message) => !message.seed))) next[sid] = true;
       }

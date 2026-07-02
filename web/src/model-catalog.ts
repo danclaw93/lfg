@@ -64,9 +64,29 @@ export const STATIC_MODEL_CATALOGS: ModelCatalogs = {
 };
 
 const AGENT_KEYS = Object.keys(STATIC_MODEL_CATALOGS) as AgentKind[];
+const VALID_SOURCES = new Set<ModelCatalogSource>(["static", "opencode-cli", "codex-cli", "hermes-api"]);
 
 function validEntry(entry: ModelCatalogEntry | undefined): entry is ModelCatalogEntry {
-  return !!entry && Array.isArray(entry.models) && entry.models.some((model) => model.trim());
+  return (
+    !!entry &&
+    Array.isArray(entry.models) &&
+    entry.models.some((model) => typeof model === "string" && model.trim())
+  );
+}
+
+function normalizeModels(models: ModelCatalogEntry["models"]): string[] {
+  return [
+    ...new Set(
+      models
+        .filter((model) => typeof model === "string")
+        .map((model) => model.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function validSource(source: unknown): source is ModelCatalogSource {
+  return typeof source === "string" && VALID_SOURCES.has(source as ModelCatalogSource);
 }
 
 export function mergeModelCatalogs(response: ModelCatalogResponse | null | undefined): ModelCatalogs {
@@ -76,13 +96,13 @@ export function mergeModelCatalogs(response: ModelCatalogResponse | null | undef
     const entry = response?.catalogs?.[key];
     if (!validEntry(entry)) continue;
 
-    const models = [...new Set(entry.models.map((model) => model.trim()).filter(Boolean))];
+    const models = normalizeModels(entry.models);
     if (!models.length) continue;
 
     next[key] = {
       models,
       defaultModel: models.includes(entry.defaultModel) ? entry.defaultModel : models[0],
-      source: entry.source,
+      source: validSource(entry.source) ? entry.source : STATIC_MODEL_CATALOGS[key].source,
       error: entry.error,
     };
   }

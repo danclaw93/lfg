@@ -25,6 +25,7 @@ describe("mergeModelCatalogs", () => {
     });
 
     expect(catalogs.codex.models).toEqual(["gpt-5.5", "gpt-5.3-codex"]);
+    expect(catalogs.opencode.models).toEqual(["opencode/big-pickle"]);
     expect(catalogs.opencode.defaultModel).toBe("opencode/big-pickle");
   });
 

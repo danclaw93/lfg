@@ -43,6 +43,35 @@ describe("mergeModelCatalogs", () => {
     expect(catalogs.codex).toEqual(STATIC_MODEL_CATALOGS.codex);
     expect(catalogs.claude).toEqual(STATIC_MODEL_CATALOGS.claude);
   });
+
+  test("filters dirty model values before trimming", () => {
+    const catalogs = mergeModelCatalogs({
+      catalogs: {
+        codex: {
+          models: [123, " gpt-5.5 ", null, "", "gpt-5.5", "gpt-5.4-mini"] as never,
+          defaultModel: "gpt-5.5",
+          source: "codex-cli",
+        },
+      },
+    });
+
+    expect(catalogs.codex.models).toEqual(["gpt-5.5", "gpt-5.4-mini"]);
+    expect(catalogs.codex.defaultModel).toBe("gpt-5.5");
+  });
+
+  test("falls back to static source when server source is invalid", () => {
+    const catalogs = mergeModelCatalogs({
+      catalogs: {
+        codex: {
+          models: ["gpt-5.3-codex"],
+          defaultModel: "gpt-5.3-codex",
+          source: "unknown-source" as never,
+        },
+      },
+    });
+
+    expect(catalogs.codex.source).toBe("static");
+  });
 });
 
 describe("catalog accessors", () => {

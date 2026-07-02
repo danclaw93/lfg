@@ -24,10 +24,10 @@ export type ModelCatalogResponse = {
 
 export const STATIC_MODEL_CATALOGS: ModelCatalogs = {
   claude: { models: ["sonnet", "opus", "haiku", "fable"], defaultModel: "sonnet", source: "static" },
-  aisdk: { models: ["opus", "sonnet", "haiku"], defaultModel: "opus", source: "static" },
-  codex: { models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"], defaultModel: "gpt-5.5", source: "static" },
+  aisdk: { models: ["fable", "opus", "sonnet", "haiku"], defaultModel: "opus", source: "static" },
+  codex: { models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"], defaultModel: "gpt-5.5", source: "static" },
   "codex-aisdk": {
-    models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+    models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
     defaultModel: "gpt-5.5",
     source: "static",
   },
@@ -43,6 +43,11 @@ export const STATIC_MODEL_CATALOGS: ModelCatalogs = {
   },
   opencode: {
     models: [
+      "opencode/big-pickle",
+      "opencode/deepseek-v4-flash-free",
+      "opencode/mimo-v2.5-free",
+      "opencode/nemotron-3-ultra-free",
+      "opencode/north-mini-code-free",
       "opencode-go/deepseek-v4-flash",
       "opencode-go/deepseek-v4-pro",
       "opencode-go/glm-5.1",
@@ -56,7 +61,6 @@ export const STATIC_MODEL_CATALOGS: ModelCatalogs = {
       "opencode-go/qwen3.6-plus",
       "opencode-go/qwen3.7-max",
       "opencode-go/qwen3.7-plus",
-      "opencode/big-pickle",
     ],
     defaultModel: "opencode-go/deepseek-v4-flash",
     source: "static",

@@ -117,7 +117,11 @@ export async function pipeToOpencodeAiSdk(
       } else if (part?.type === "tool-call") {
         log(`[runner] opencode running tool: ${part.toolName ?? "?"}`);
       } else if (part?.type === "error") {
-        throw new Error(String((part as any).error).slice(0, 800));
+        const error = (part as any).error;
+        const kind = classifyOpencodeStreamError(error);
+        const errText = opencodeErrorText(error).slice(0, 800);
+        if (kind === "fatal" || kind === "question") throw new Error(errText);
+        log(`[runner] opencode stream error (${kind}): ${errText}`);
       }
     }
     const text = await result.text;
@@ -170,6 +174,57 @@ function latestOpencodeError(opencodeSessionId: string): string | null {
     }
   } catch {}
   return null;
+}
+
+function opencodeErrorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string")
+    return (error as { message: string }).message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+export type OpencodeStreamErrorKind = "fatal" | "recoverable" | "question" | "unknown";
+
+export function classifyOpencodeStreamError(error: unknown): OpencodeStreamErrorKind {
+  const text = opencodeErrorText(error);
+  if (/question\.asked|not yet mapped|question asked|asking/i.test(text)) return "question";
+
+  const statusCode =
+    error && typeof error === "object" && typeof (error as { statusCode?: unknown }).statusCode === "number"
+      ? (error as { statusCode: number }).statusCode
+      : undefined;
+  const isRetryable =
+    error && typeof error === "object" && (error as { isRetryable?: unknown }).isRetryable === true;
+  const errorType =
+    error && typeof error === "object"
+      ? String((error as { data?: { errorType?: unknown } }).data?.errorType ?? "")
+      : "";
+
+  if (
+    statusCode === 401 ||
+    statusCode === 403 ||
+    /^(AuthenticationError|LoadAPIKeyError|NoSuchModelError)$/i.test(errorType) ||
+    /\b(authentication|unauthorized|forbidden|api key|invalid key|access denied|permission denied)\b/i.test(text) ||
+    /\b(no such model|model not found|invalid model|model .* not found)\b/i.test(text)
+  ) {
+    return "fatal";
+  }
+
+  if (
+    isRetryable ||
+    statusCode === 429 ||
+    (statusCode !== undefined && statusCode >= 500) ||
+    /\b(timeout|timed out|econnreset|network|socket|temporarily unavailable)\b/i.test(text)
+  ) {
+    return "recoverable";
+  }
+
+  return "unknown";
 }
 
 export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
@@ -315,25 +370,59 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     let textBuf = "";
     const toolBlocks: unknown[] = [];
 
+    // Live streaming. Unlike the claude/codex harnesses (whose provider writes
+    // incremental JSONL lines the live view tails as the turn runs), this harness
+    // self-persists and otherwise wouldn't touch the transcript until flush at
+    // turn end — so the whole reply pops in at once with nothing in between. To
+    // stream, periodically append the accumulated text so far as a *thinking*
+    // line: the live view renders thinking as a single bubble that is replaced on
+    // each new one (exempt from uuid dedupe) and cleared the moment the final
+    // assistant text line lands. These are ephemeral live-only snapshots — a
+    // fresh uuid each time, and we DON'T advance parentUuid (the real assistant
+    // line below chains directly off the user turn). Throttled so the transcript
+    // file doesn't bloat with one snapshot per token.
+    let lastStream = 0;
+    const streamThinking = (force = false): void => {
+      if (!textBuf.trim()) return;
+      const now = Date.now();
+      if (!force && now - lastStream < 600) return;
+      lastStream = now;
+      appendLine({
+        parentUuid,
+        type: "assistant",
+        message: { role: "assistant", model, content: [{ type: "thinking", thinking: textBuf }] },
+        uuid: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        cwd,
+        sessionId: key,
+      });
+    };
+    let streamErrorText: string | null = null;
+
     try {
       publishDraft("", true); // reset the animated draft at turn start
       for await (const part of result.fullStream as any) {
         try {
           const t = part?.type;
           if (t === "error") {
-            const errText = String((part as any).error);
-            // The opencode provider emits an "error" stream part for events it
-            // hasn't mapped yet — notably `question.asked` (the interactive
-            // question event, which this headless harness can't answer anyway).
-            if (/question\.asked|not yet mapped|question asked|asking/i.test(errText)) {
+            const error = (part as any).error;
+            const kind = classifyOpencodeStreamError(error);
+            const errText = opencodeErrorText(error);
+            if (kind === "question") {
               console.error(
                 `opencode-aisdk-session: ignoring unmapped stream event — ${errText.slice(0, 200)}`,
               );
               // Do not continue awaiting; finish the turn so we don't hang with busy=true.
               // Any preceding text/tool output will be flushed below.
               throw new Error("OPENCODE_QUESTION_ASKED");
-            } else {
+            } else if (kind === "fatal") {
               throw new Error(errText.slice(0, 800));
+            } else {
+              // OpenCode can emit transient provider errors and then continue
+              // the same turn after its own retry. Keep consuming the stream;
+              // if no usable output arrives, this message is surfaced below.
+              streamErrorText = errText.slice(0, 800);
+              console.error(`opencode-aisdk-session stream error (${kind}): ${streamErrorText}`);
             }
           } else if (t === "text-delta") {
             // AI SDK streams text as `text-delta` parts; tolerate both current
@@ -378,8 +467,15 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
         if ((e as any)?.message === "OPENCODE_QUESTION_ASKED") throw e;
       }
 
-      publishDraft(textBuf, true);
-      await result.text; // surfaces a failed generation
+      try {
+        publishDraft(textBuf, true);
+        await result.text; // surfaces a failed generation
+      } catch (e) {
+        if (!textBuf.trim() && !toolBlocks.length) throw e;
+        console.error(
+          `opencode-aisdk-session: result.text failed after usable output: ${opencodeErrorText(e).slice(0, 800)}`,
+        );
+      }
 
       // Capture opencode's resume sessionId from the resolved metadata and pin
       // it for resume on later turns. It is NOT a transcript id (we own the
@@ -411,6 +507,8 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
               type: "text",
               text: logged
                 ? `OpenCode turn failed for ${model}: ${logged}`
+                : streamErrorText
+                  ? `OpenCode turn failed for ${model}: ${streamErrorText}`
                 : `OpenCode returned no assistant output for ${model}; check the OpenCode provider logs.`,
             },
           ],
@@ -460,6 +558,7 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
       }
       console.error(`opencode-aisdk-session turn failed: ${message}`);
       flushAssistant(textBuf, toolBlocks);
+      if (textBuf.trim() || toolBlocks.length) return;
       writeAssistant(
         [{ type: "text", text: `OpenCode turn failed for ${model}: ${message}` }],
         true,
